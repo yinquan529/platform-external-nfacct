@@ -23,7 +23,6 @@
 #include <unistd.h>
 #include <time.h>
 #include <errno.h>
-
 #include <netlink-local.h>
 #include <linux/netlink.h>
 #include <linux/netfilter/nfnetlink.h>
@@ -45,6 +44,7 @@ enum {
 	NFACCT_CMD_VERSION,
 	NFACCT_CMD_HELP,
 	NFACCT_CMD_RESTORE,
+	NFACCT_CMD_LISTEN,
 };
 
 static int nfacct_cmd_list(int argc, char *argv[]);
@@ -55,6 +55,7 @@ static int nfacct_cmd_flush(int argc, char *argv[]);
 static int nfacct_cmd_version(int argc, char *argv[]);
 static int nfacct_cmd_help(int argc, char *argv[]);
 static int nfacct_cmd_restore(int argc, char *argv[]);
+static int nfacct_cmd_listen(int argc, char *argv[]);
 
 #ifndef HAVE_LIBNL20
 #define nl_sock nl_handle
@@ -102,6 +103,8 @@ int main(int argc, char *argv[])
 		cmd = NFACCT_CMD_HELP;
 	else if (strncmp(argv[1], "restore", strlen(argv[1])) == 0)
 		cmd = NFACCT_CMD_RESTORE;
+	else if (strncmp(argv[1], "monitor", strlen(argv[1])) == 0)
+		cmd = NFACCT_CMD_LISTEN;
 	else {
 		fprintf(stderr, "nfacct v%s: Unknown command: %s\n",
 			VERSION, argv[1]);
@@ -134,6 +137,9 @@ int main(int argc, char *argv[])
 	case NFACCT_CMD_RESTORE:
 		ret = nfacct_cmd_restore(argc, argv);
 		break;
+	case NFACCT_CMD_LISTEN:
+		ret = nfacct_cmd_listen(argc, argv);
+		break;
 	}
 	return ret < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
@@ -159,7 +165,7 @@ static int valid_input(struct nl_msg *msg, void *arg)
 					 sizeof(struct nfgenmsg));
 	struct nlattr *tb[NFACCT_NAME_MAX+1] = {};
 	char buf[4096];
-	int ret;
+	int ret, flags;
 
 	ret = nlmsg_parse(nlmsg_hdr(msg),
 			 sizeof(struct nfgenmsg), tb, NFACCT_MAX, NULL);
@@ -169,11 +175,22 @@ static int valid_input(struct nl_msg *msg, void *arg)
 		return ret;
 	}
 
-	ret = snprintf(buf, sizeof(buf),
-		"{ pkts = %.20llu, bytes = %.20llu } = %s;",
-		(unsigned long long)be64toh(nla_get_u64(tb[NFACCT_PKTS])),
-		(unsigned long long)be64toh(nla_get_u64(tb[NFACCT_BYTES])),
-		nla_get_string(tb[NFACCT_NAME]));
+	if (!tb[NFACCT_FLAGS]) {
+		ret = snprintf(buf, sizeof(buf),
+			"{ pkts = %.20llu, bytes = %.20llu } = %s;",
+			(unsigned long long)be64toh(nla_get_u64(tb[NFACCT_PKTS])),
+			(unsigned long long)be64toh(nla_get_u64(tb[NFACCT_BYTES])),
+			nla_get_string(tb[NFACCT_NAME]));
+	} else {
+		flags = (unsigned long)be32toh(nla_get_u32(tb[NFACCT_FLAGS]));
+		ret = snprintf(buf, sizeof(buf),
+			"{ pkts = %.20llu, bytes = %.20llu, quota = %.20llu, mode = %s } = %s;",
+			(unsigned long long)be64toh(nla_get_u64(tb[NFACCT_PKTS])),
+			(unsigned long long)be64toh(nla_get_u64(tb[NFACCT_BYTES])),
+			(unsigned long long)be64toh(nla_get_u64(tb[NFACCT_QUOTA])),
+			flags == NFACCT_F_QUOTA_BYTES ? "byte" : "packet",
+			nla_get_string(tb[NFACCT_NAME]));
+	}
 
 	printf("%s\n", buf);
 
@@ -247,7 +264,8 @@ fail:
 	return ret;
 }
 
-static int _nfacct_cmd_add(char *name, int pkts, int bytes)
+static int _nfacct_cmd_add(char *name, int pkts, int bytes,
+		           int flags, uint64_t quota)
 {
 	struct nl_msg *msg;
 	struct nl_sock *handle;
@@ -279,6 +297,10 @@ static int _nfacct_cmd_add(char *name, int pkts, int bytes)
 	nla_put_string(msg, NFACCT_NAME, nfname);
 	nla_put_u64(msg, NFACCT_PKTS, htobe64(pkts));
 	nla_put_u64(msg, NFACCT_BYTES, htobe64(bytes));
+	if (flags) {
+		nla_put_u64(msg, NFACCT_FLAGS, htobe32(flags));
+		nla_put_u64(msg, NFACCT_QUOTA, htobe64(quota));
+	}
 
 	handle = nl_socket_alloc();
 	if ((ret = nfnl_connect(handle))) {
@@ -307,19 +329,47 @@ fail:
 	return ret;
 }
 
-
-
 static int nfacct_cmd_add(int argc, char *argv[])
 {
+	int mode, ret;
+	uint64_t quota;
+
 	if (argc < 3) {
 		nfacct_perror("missing object name");
-		return -1;
-	} else if (argc > 3) {
-		nfacct_perror("too many arguments");
-		return -1;
+		return EINVAL;
 	}
 
-	return _nfacct_cmd_add(argv[2], 0, 0);
+	if (argc == 3)
+		 return _nfacct_cmd_add(argv[2], 0, 0, 0, 0);
+
+	if (argc == 4) {
+		nfacct_perror("missing quota value");
+		return EINVAL;
+	}
+
+	if (argc == 5) {
+		if (strcmp(argv[3], "byte") && strcmp(argv[3], "packet")) {
+			nfacct_perror("argument must "
+				      "\"byte\" or \"packet\"");
+			return EINVAL;
+		}
+	}
+
+	if (argc > 5) {
+		nfacct_perror("too many arguments");
+		return EINVAL;
+	}
+
+	mode = (strcmp(argv[3], "byte") == 0 ?
+		NFACCT_F_QUOTA_BYTES : NFACCT_F_QUOTA_PKTS);
+
+	ret = sscanf(argv[4], "%llu", &quota);
+	if (ret != 1) {
+		nfacct_perror("error reading quota");
+		return EINVAL;
+	}
+
+	return _nfacct_cmd_add(argv[2], 0, 0, mode, quota);
 }
 
 static int nfacct_cmd_delete(int argc, char *argv[])
@@ -386,7 +436,6 @@ fail_send:
 fail:
 	nlmsg_free(msg);
 	return ret;
-	return 0;
 }
 
 
@@ -564,14 +613,16 @@ static const char help_msg[] =
 	"infrastructure\n"
 	"Usage: %s command [parameters]...\n\n"
 	"Commands:\n"
-	"  list [reset]\t\tList the accounting object table (and reset)\n"
-	"  add object-name\tAdd new accounting object to table\n"
-	"  delete object-name\tDelete existing accounting object\n"
-	"  get object-name\tGet existing accounting object\n"
-	"  flush\t\t\tFlush accounting object table\n"
-	"  restore\t\tRestore accounting object table reading 'list' output from stdin\n"
-	"  version\t\tDisplay version and disclaimer\n"
-	"  help\t\t\tDisplay this help message\n";
+	"  list [reset]\t\t\tList the accounting object table (and reset)\n"
+	"  add object-name\t\tAdd new accounting object to table\n"
+	"  add object-name [{byte|packet} quota]\tAdd new accounting object and quota to table\n"
+	"  delete object-name\t\tDelete existing accounting object\n"
+	"  get object-name\t\tGet existing accounting object\n"
+	"  flush\t\t\t\tFlush accounting object table\n"
+	"  restore\t\t\tRestore accounting object table reading 'list' output from stdin\n"
+	"  monitor\t\t\tListens for quota attainment notifications\n"
+	"  version\t\t\tDisplay version and disclaimer\n"
+	"  help\t\t\t\tDisplay this help message\n";
 
 static int nfacct_cmd_help(int argc, char *argv[])
 {
@@ -581,26 +632,89 @@ static int nfacct_cmd_help(int argc, char *argv[])
 
 static int nfacct_cmd_restore(int argc, char *argv[])
 {
-	uint64_t pkts, bytes;
-	char name[512];
-	char buffer[512];
-	int ret;
+	uint64_t pkts, bytes, quota;
+	char name[512], mode[512], buffer[512];
+	int ret, flags;
+
 	while (fgets(buffer, sizeof(buffer), stdin)) {
 		char *semicolon = strchr(buffer, ';');
+
+		/* make sure we have a ';' a the end of a line */
 		if (semicolon == NULL) {
 			nfacct_perror("invalid line");
-			return -1;
+			return EINVAL;
 		}
-		*semicolon = 0;
-		ret = sscanf(buffer, "{ pkts = %llu, bytes = %llu } = %s",
-		       &pkts, &bytes, name);
-		if (ret != 3) {
-			nfacct_perror("error reading input");
-			return -1;
-		}
-		if ((ret = _nfacct_cmd_add(name, pkts, bytes)) != 0)
-			return ret;
 
+		*semicolon = 0;
+		ret = flags = 0;
+		quota = 0;
+
+		if (!strstr(buffer, "quota")) {
+			ret = sscanf(buffer, "{ pkts = %llu, bytes = %llu } = %s",
+				     &pkts, &bytes, name);
+			if (ret != 3) {
+				nfacct_perror("error reading input");
+				return EINVAL;
+			}
+		} else {
+			ret = sscanf(buffer, "{ pkts = %llu, bytes = %llu, quota = %llu, mode = %s } = %s",
+				     &pkts, &bytes, &quota, mode, name);
+			if (ret != 5) {
+				nfacct_perror("error reading input");
+				return EINVAL;
+			}
+
+			flags = (strcmp(mode, "byte") == 0 ?
+				NFACCT_F_QUOTA_BYTES : NFACCT_F_QUOTA_PKTS);
+		}
+
+		if ((ret = _nfacct_cmd_add(name, pkts, bytes, flags, quota)) != 0)
+			return ret;
 	}
 	return 0;
+}
+
+static int nfacct_cmd_listen(int argc, char *argv[])
+{
+	struct nl_sock *nlh;
+	int err = 1;
+	int i, idx;
+
+	nlh = nl_socket_alloc();
+	if (nlh == NULL)
+		return -1;
+
+	nl_socket_disable_seq_check(nlh);
+
+	nl_socket_modify_cb(nlh, NL_CB_VALID, NL_CB_CUSTOM, valid_input, NULL);
+
+	if (nfnl_connect(nlh) < 0) {
+		goto errout;
+	}
+
+	if (nl_socket_add_membership(nlh, NFNLGRP_ACCT_QUOTA) < 0) {
+		goto errout;
+	}
+
+	 while (1) {
+		fd_set rfds;
+		int fd, retval;
+
+		fd = nl_socket_get_fd(nlh);
+
+		FD_ZERO(&rfds);
+		FD_SET(fd, &rfds);
+		/* wait for an incoming message on the netlink socket */
+		retval = select(fd+1, &rfds, NULL, NULL, NULL);
+
+		if (retval) {
+			/* FD_ISSET(fd, &rfds) will be true */
+			nl_recvmsgs_default(nlh);
+		}
+	}
+
+	nl_close(nlh);
+	nl_socket_free(nlh);
+errout:
+	return err;
 }
